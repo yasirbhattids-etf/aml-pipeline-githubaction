@@ -1,0 +1,108 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub Actions — iShares ETF Daily Holdings Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+# FREE hosting on GitHub Actions:
+#   • Public repos  → unlimited minutes
+#   • Private repos → 2,000 free min / month (≈ 66 runs of ~30 min each)
+#
+# How it works:
+#   1. Runs automatically at 9 PM UTC on weekdays (after US market close)
+#   2. Downloads ETF holdings CSVs from iShares
+#   3. Loads into SQLite — committed back to the repo
+#   4. DB is queryable via GitHub UI or by cloning the repo
+#
+# To enable:
+#   1. Put pipeline.py and Folder_Ishares.csv in repo root
+#   2. Commit this file to .github/workflows/daily_etf.yml
+#   3. Go to Settings → Actions → General → Allow all actions
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Daily ETF Holdings Pipeline
+
+on:
+  schedule:
+    # 9 PM UTC Mon–Fri  (= 4 PM ET / 5 PM ET depending on DST)
+    - cron: "0 21 * * 1-5"
+
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Holdings date (YYYYMMDD) — leave blank for yesterday"
+        required: false
+        default: ""
+      tickers:
+        description: "Space-separated ticker list — leave blank for all"
+        required: false
+        default: ""
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout repo ──────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so git push works
+          fetch-depth: 0
+
+      # ── 2. Python setup ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas requests urllib3
+
+      # ── 4. Resolve date ───────────────────────────────────────────────────
+      - name: Resolve run date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            echo "date=${{ github.event.inputs.date }}" >> $GITHUB_OUTPUT
+          else
+            echo "date=$(date -d 'yesterday' +'%Y%m%d')" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 5. Run pipeline ───────────────────────────────────────────────────
+      - name: Run ETF pipeline
+        run: |
+          TICKER_ARG=""
+          if [ -n "${{ github.event.inputs.tickers }}" ]; then
+            TICKER_ARG="--ticker ${{ github.event.inputs.tickers }}"
+          fi
+          python pipeline.py \
+            --date ${{ steps.date.outputs.date }} \
+            --workers 15 \
+            --update-meta \
+            $TICKER_ARG
+
+      # ── 6. Upload logs as artifact ────────────────────────────────────────
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ steps.date.outputs.date }}
+          path: Log/
+          retention-days: 30
+
+      # ── 7. Commit DB + downloads back to repo ─────────────────────────────
+      - name: Commit updated DB
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add db/meta.db
+          git add Log/*.log
+          # Only commit if there are changes
+          git diff --cached --quiet || git commit -m "chore: ETF holdings update ${{ steps.date.outputs.date }}"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
