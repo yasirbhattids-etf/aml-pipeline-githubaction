@@ -90,7 +90,9 @@ DB_COLS = [
 ]
 
 # HTTP settings
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = (10, 60)   # (connect_timeout, read_timeout) in seconds
+                             # read_timeout = max silence between packets, not total download time
+MAX_FILE_SIZE   = 50 * 1024 * 1024  # skip files > 50 MB (sanity check)
 MAX_RETRIES     = 3
 BACKOFF_FACTOR  = 1.5
 RATE_LIMIT_SLEEP = 0.3   # seconds between requests per worker
@@ -210,12 +212,32 @@ def download_holdings(
     logger.debug(f"[{ticker}] GET {url}")
 
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200 and len(resp.content) > 200:
-            dest.write_bytes(resp.content)
-            logger.info(f"[{ticker}] ✓ Downloaded {len(resp.content):,} bytes → {filename}")
-            return dest
-        logger.warning(f"[{ticker}] ✗ HTTP {resp.status_code} ({len(resp.content)} bytes)")
+        resp = session.get(url, timeout=REQUEST_TIMEOUT, stream=True)
+        if resp.status_code != 200:
+            logger.warning(f"[{ticker}] ✗ HTTP {resp.status_code}")
+            return None
+
+        # Stream in chunks — if server stalls between packets for > read_timeout
+        # seconds, requests raises ReadTimeout instead of hanging forever
+        chunks, total = [], 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_FILE_SIZE:
+                    logger.warning(f"[{ticker}] ✗ File > 50 MB — skipping")
+                    return None
+
+        if total < 200:
+            logger.warning(f"[{ticker}] ✗ Response too small ({total} bytes)")
+            return None
+
+        dest.write_bytes(b"".join(chunks))
+        logger.info(f"[{ticker}] ✓ Downloaded {total:,} bytes → {filename}")
+        return dest
+
+    except requests.exceptions.Timeout:
+        logger.error(f"[{ticker}] ✗ Timed out (server stalled)")
         return None
     except requests.RequestException as exc:
         logger.error(f"[{ticker}] ✗ Request error: {exc}")
