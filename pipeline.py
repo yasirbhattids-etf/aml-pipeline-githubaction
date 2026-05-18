@@ -339,7 +339,14 @@ def parse_holdings_csv(
             engine="python",
         )
 
+        # Strip surrounding quotes from column names (iShares CSVs sometimes
+        # return headers as "Ticker","Name",... with literal quote chars)
+        df.columns = df.columns.str.strip('"').str.strip()
+
         # ── Drop any stray footer / blank / BOM rows ──────────────────────────
+        if "Ticker" not in df.columns:
+            logger.error(f"[{etf_ticker}] Columns found: {df.columns.tolist()}")
+            raise ValueError(f"No 'Ticker' column — columns: {df.columns.tolist()}")
         df = df[df["Ticker"].apply(_is_data_row)].copy()
 
         if df.empty:
