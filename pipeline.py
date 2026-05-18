@@ -492,9 +492,12 @@ def process_one(
             return ticker, False, "Download failed"
 
     # ── Parse CSV ─────────────────────────────────────────────────────────────
+    logger.info(f"[{ticker}] Parsing CSV...")
     df = parse_holdings_csv(csv_path, ticker, date, logger)
     if df is None or df.empty:
         return ticker, False, "Parse returned no data"
+
+    logger.info(f"[{ticker}] Parse done — {len(df)} rows. Inserting to DB...")
 
     # ── DB upsert (each worker opens its own connection — WAL allows this) ───
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
