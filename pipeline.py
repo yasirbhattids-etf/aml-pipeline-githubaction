@@ -44,6 +44,7 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -146,34 +147,14 @@ def setup_logging(date: str) -> logging.Logger:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_session() -> requests.Session:
+    """Fallback requests session for non-iShares HTTP calls."""
     session = requests.Session()
-    retry = Retry(
-        total=MAX_RETRIES,
-        backoff_factor=BACKOFF_FACTOR,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://",  adapter)
-    session.headers.update({
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection":      "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest":  "document",
-        "Sec-Fetch-Mode":  "navigate",
-        "Sec-Fetch-Site":  "none",
-        "Sec-Fetch-User":  "?1",
-    })
+    retry = Retry(total=3, backoff_factor=1.5,
+                  status_forcelist=[429, 500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://",  HTTPAdapter(max_retries=retry))
     return session
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# URL CONSTRUCTION
-# ══════════════════════════════════════════════════════════════════════════════
 
 def build_download_url(product_url: str, date: str) -> str:
     """
@@ -182,16 +163,76 @@ def build_download_url(product_url: str, date: str) -> str:
     Product URL:  https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf
     Download URL: .../239726/ishares-core-sp-500-etf/1467271812594.ajax
                   ?fileType=csv&dataType=fund&asOfDate=20260514
-
-    Works for US, UK, DE, CH regional URLs — same Ajax ID everywhere.
     """
     base = product_url.rstrip("/")
     return f"{base}/{ISHARES_AJAX_ID}.ajax?fileType=csv&dataType=fund&asOfDate={date}"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CSV DOWNLOAD
-# ══════════════════════════════════════════════════════════════════════════════
+async def _playwright_download(product_url: str, download_url: str, dest: Path) -> bool:
+    """
+    Anti-detection Playwright download:
+      1. Launch Chrome with webdriver flag removed (bypasses navigator.webdriver check)
+      2. Visit product page + simulate human behaviour (mouse, scroll)
+      3. Wait for Akamai _abck cookie to be set by JS challenge
+      4. Use expect_download to capture the CSV file download
+    """
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx  = await browser.new_context(
+            accept_downloads=True,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await ctx.new_page()
+
+        # Remove navigator.webdriver — Akamai checks this
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+        # Visit product page
+        await page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
+
+        # Simulate human behaviour: mouse move + scroll
+        await page.mouse.move(400, 300)
+        await page.wait_for_timeout(1000)
+        await page.evaluate("window.scrollTo(0, 400)")
+        await page.wait_for_timeout(1000)
+
+        # Wait up to 10s for Akamai _abck cookie (JS challenge completion)
+        for _ in range(20):
+            cookies = await ctx.cookies()
+            if any(c["name"] == "_abck" for c in cookies):
+                break
+            await page.wait_for_timeout(500)
+
+        # Trigger CSV download — "Download is starting" error is expected and OK
+        async with page.expect_download(timeout=60000) as dl_info:
+            try:
+                await page.goto(download_url)
+            except Exception as e:
+                if "Download is starting" not in str(e):
+                    raise
+
+        dl   = await dl_info.value
+        await dl.save_as(str(dest))
+        await browser.close()
+
+    if not dest.exists():
+        return False
+    sample = dest.read_bytes()[:500].decode("ISO-8859-1", errors="ignore")
+    if any(m in sample.lower() for m in ("<html", "<!doctype", "</div>")):
+        dest.unlink()   # remove the HTML file so it is not reused
+        return False
+    return dest.stat().st_size > 200
+
+
 
 def download_holdings(
     session:     requests.Session,
@@ -203,92 +244,56 @@ def download_holdings(
     logger:      logging.Logger,
 ) -> Optional[Path]:
     """
-    Download holdings CSV for one ETF. Returns saved path or None.
-    Skips if the file already exists on disk.
+    Download holdings CSV using headless Playwright.
+    Playwright executes the Akamai JS challenge — the only reliable method
+    after iShares added bot detection to the CSV endpoint.
     """
-    safe_fund = re.sub(r'[\\/*?:"<>|]', "_", fund_name)
-    filename  = f"{ticker}_{safe_fund}_{date}.csv"
-    dest      = csv_dir / filename
+    safe_fund    = re.sub(r'[\\/*?:"<>|]', "_", fund_name)
+    filename     = f"{ticker}_{safe_fund}_{date}.csv"
+    dest         = csv_dir / filename
 
     if dest.exists():
         logger.debug(f"[{ticker}] Already on disk — skipping download")
         return dest
 
     download_url = build_download_url(product_url, date)
-
-    try:
-        # Step 1: visit the product page to set session cookies
-        # Use per-request headers (NOT session.headers.update) — session is
-        # shared across workers and concurrent updates cause a race condition
-        logger.debug(f"[{ticker}] Warming session via product page...")
-        warm = session.get(
-            product_url,
-            timeout=REQUEST_TIMEOUT,
-            headers={"Referer": "https://www.ishares.com/"},
-        )
-        if warm.status_code not in (200, 302):
-            logger.warning(f"[{ticker}] ✗ Product page HTTP {warm.status_code}")
-            return None
-        time.sleep(1.5)
-
-        # Step 2: download CSV — Referer points to the product page
-        logger.debug(f"[{ticker}] GET {download_url}")
-        resp = session.get(
-            download_url,
-            timeout=REQUEST_TIMEOUT,
-            headers={"Referer": product_url},
-        )
-
-        if resp.status_code != 200:
-            logger.warning(f"[{ticker}] ✗ HTTP {resp.status_code}")
-            return None
-        if len(resp.content) < 200:
-            logger.warning(f"[{ticker}] ✗ Response too small ({len(resp.content)} bytes)")
-            return None
-
-        # Guard: iShares serves a large HTML SPA page (~10MB) when bot detection
-        # triggers. It returns HTTP 200 with a large body so size checks don't
-        # help. Detect HTML by scanning the first 1000 bytes for markup.
-        sample = resp.content[:1000].decode("ISO-8859-1", errors="ignore")
-        sample_stripped = sample.strip().lstrip("\ufeff\xef\xbb\xbf")  # strip BOM
-        html_markers = ("<html", "<!doctype", "</div>", "<script", "<head>", "<body")
-        if (sample_stripped.startswith("<") or
-                any(m in sample.lower() for m in html_markers)):
-            logger.warning(f"[{ticker}] ✗ Got HTML instead of CSV — bot detection")
-            logger.debug(f"[{ticker}] First 200 chars: {sample[:200]!r}")
-            return None
-
-        dest.write_bytes(resp.content)
-        logger.info(f"[{ticker}] ✓ Downloaded {len(resp.content):,} bytes → {filename}")
-        return dest
-
-    except requests.exceptions.Timeout:
-        logger.error(f"[{ticker}] ✗ Timed out after {REQUEST_TIMEOUT}s")
-        return None
-    except requests.RequestException as exc:
-        logger.error(f"[{ticker}] ✗ Request error: {exc}")
-        return None
-    finally:
-        time.sleep(RATE_LIMIT_SLEEP)
+    success      = download_with_playwright(product_url, download_url, dest, ticker, logger)
+    time.sleep(RATE_LIMIT_SLEEP)
+    return dest if success else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CSV PARSING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _find_header_line(lines: List[str]) -> int:
+def _find_header_line(lines: List[str], logger: Optional[logging.Logger] = None) -> int:
     """
     Find the CSV header row (contains Ticker, Name, Sector).
-    Rejects lines that contain HTML tags — iShares sometimes returns an HTML
-    page that mentions these words inside markup like <td>Ticker</td>.
+    Rejects lines that look like HTML tags — a real CSV header never has
+    patterns like <td>Ticker</td>; it looks like: Ticker,Name,Sector,...
     """
+    candidates = []
     for i, line in enumerate(lines):
         if "Ticker" in line and "Name" in line and "Sector" in line:
-            # Reject HTML lines — a real CSV header has no angle brackets
-            if "<" in line or ">" in line:
+            candidates.append((i, line))
+            # Reject obvious HTML — must have <word> pattern (tag), not just <
+            # e.g. "<td>Ticker" is HTML but "Ticker,Name" is CSV
+            import re as _re
+            if _re.search(r"<[a-zA-Z/]", line):
                 continue
             return i
-    raise ValueError("Cannot find CSV header row (no HTML-free line with Ticker/Name/Sector)")
+
+    if logger and candidates:
+        logger.debug(f"Header candidates found but all rejected as HTML: "
+                     f"{[(i, repr(l[:80])) for i, l in candidates]}")
+
+    # Fallback: log first 15 lines to help diagnose format changes
+    if logger:
+        logger.debug("First 15 lines of file:")
+        for i, l in enumerate(lines[:15]):
+            logger.debug(f"  line {i}: {repr(l[:100])}")
+
+    raise ValueError("Cannot find CSV header row — check debug log for file contents")
 
 
 def _is_data_row(ticker_val: str) -> bool:
@@ -340,7 +345,7 @@ def parse_holdings_csv(
         text = raw.decode("ISO-8859-1")
         lines = text.splitlines()
 
-        header_idx = _find_header_line(lines)
+        header_idx = _find_header_line(lines, logger)
 
         # Only pass real data lines to pd.read_csv — stop at first blank or
         # footer prose line. Passing the entire file (with 10+ lines of legal
@@ -508,6 +513,37 @@ def update_ishare_meta(
     df.to_sql("ishare_meta", conn, if_exists="replace", index=False)
     conn.commit()
     logger.info(f"ishare_meta: {len(df):,} rows written")
+
+
+
+def download_with_playwright(
+    product_url:  str,
+    download_url: str,
+    dest:         Path,
+    ticker:       str,
+    logger:       logging.Logger,
+) -> bool:
+    """
+    Uses Playwright browser context request (Chrome TLS + Akamai cookies)
+    to download the CSV — the only approach that bypasses iShares bot detection.
+    """
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        logger.debug(f"[{ticker}] Launching Playwright...")
+        result = loop.run_until_complete(
+            _playwright_download(product_url, download_url, dest)
+        )
+        if result:
+            logger.info(f"[{ticker}] ✓ Downloaded {dest.stat().st_size:,} bytes → {dest.name}")
+        else:
+            logger.warning(f"[{ticker}] ✗ Bot detection not bypassed")
+        return result
+    except Exception as exc:
+        logger.error(f"[{ticker}] ✗ Playwright error: {exc}", exc_info=True)
+        return False
+    finally:
+        loop.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
