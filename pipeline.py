@@ -170,67 +170,55 @@ def build_download_url(product_url: str, date: str) -> str:
 
 async def _playwright_download(product_url: str, download_url: str, dest: Path) -> bool:
     """
-    Anti-detection Playwright download:
-      1. Launch Chrome with webdriver flag removed (bypasses navigator.webdriver check)
-      2. Visit product page + simulate human behaviour (mouse, scroll)
-      3. Wait for Akamai _abck cookie to be set by JS challenge
-      4. Use expect_download to capture the CSV file download
+    Download strategy:
+      1. Use Firefox (different fingerprint from Chrome — Akamai treats it differently)
+      2. Visit product page to satisfy Akamai JS challenge
+      3. Intercept the network response directly (avoids expect_download issues)
+      4. Save raw bytes — validate it is CSV not HTML
     """
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx  = await browser.new_context(
-            accept_downloads=True,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        page = await ctx.new_page()
+        # Firefox has a different TLS + JS fingerprint than Chrome
+        # and is less aggressively targeted by Akamai bot detection
+        browser = await pw.firefox.launch(headless=True)
+        ctx     = await browser.new_context()
+        page    = await ctx.new_page()
 
-        # Remove navigator.webdriver — Akamai checks this
-        await page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        # Intercept the holdings response at network level
+        csv_body: list = []
 
-        # Visit product page
+        async def capture(response):
+            if "1467271812594.ajax" in response.url or "fileType=csv" in response.url:
+                try:
+                    body = await response.body()
+                    csv_body.append(body)
+                except Exception:
+                    pass
+
+        page.on("response", capture)
+
+        # Visit product page — Akamai JS challenge runs here
         await page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
 
-        # Simulate human behaviour: mouse move + scroll
-        await page.mouse.move(400, 300)
-        await page.wait_for_timeout(1000)
-        await page.evaluate("window.scrollTo(0, 400)")
-        await page.wait_for_timeout(1000)
+        # Navigate to download URL — response is intercepted above
+        try:
+            await page.goto(download_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass   # may throw on file downloads — that is fine
+        await page.wait_for_timeout(3000)
 
-        # Wait up to 10s for Akamai _abck cookie (JS challenge completion)
-        for _ in range(20):
-            cookies = await ctx.cookies()
-            if any(c["name"] == "_abck" for c in cookies):
-                break
-            await page.wait_for_timeout(500)
-
-        # Trigger CSV download — "Download is starting" error is expected and OK
-        async with page.expect_download(timeout=60000) as dl_info:
-            try:
-                await page.goto(download_url)
-            except Exception as e:
-                if "Download is starting" not in str(e):
-                    raise
-
-        dl   = await dl_info.value
-        await dl.save_as(str(dest))
         await browser.close()
 
-    if not dest.exists():
+    if not csv_body:
         return False
-    sample = dest.read_bytes()[:500].decode("ISO-8859-1", errors="ignore")
+
+    body   = csv_body[0]
+    sample = body[:500].decode("ISO-8859-1", errors="ignore")
     if any(m in sample.lower() for m in ("<html", "<!doctype", "</div>")):
-        dest.unlink()   # remove the HTML file so it is not reused
         return False
-    return dest.stat().st_size > 200
+
+    dest.write_bytes(body)
+    return dest.exists() and dest.stat().st_size > 200
 
 
 

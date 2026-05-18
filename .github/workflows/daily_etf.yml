@@ -63,7 +63,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pandas requests urllib3 playwright
-          python -m playwright install chromium --with-deps
+          python -m playwright install firefox --with-deps
 
       # ── 4. Resolve date ───────────────────────────────────────────────────
       - name: Resolve run date
