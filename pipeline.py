@@ -95,9 +95,9 @@ REQUEST_TIMEOUT = (10, 60)   # (connect_timeout, read_timeout) in seconds
 MAX_FILE_SIZE   = 50 * 1024 * 1024  # skip files > 50 MB (sanity check)
 MAX_RETRIES     = 3
 BACKOFF_FACTOR  = 1.5
-RATE_LIMIT_SLEEP = 0.3   # seconds between requests per worker
+RATE_LIMIT_SLEEP = 2.0   # seconds between requests per worker — iShares rate limits aggressively
 
-DEFAULT_WORKERS = 10
+DEFAULT_WORKERS = 3      # keep low — iShares throttles hard above ~5 concurrent
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -574,17 +574,24 @@ def run(
         }
 
         for future in as_completed(futures):
+            ticker_name = futures[future]
             try:
-                etf, success, msg = future.result()
+                # Hard 3-minute cap per ETF — prevents one stalled download
+                # from blocking the entire pipeline indefinitely
+                etf, success, msg = future.result(timeout=180)
                 if success:
                     ok_count += 1
                     logger.info(f"  ✓ [{etf}]  {msg}")
                 else:
                     err_count += 1
                     logger.warning(f"  ✗ [{etf}]  {msg}")
+            except TimeoutError:
+                err_count += 1
+                future.cancel()
+                logger.error(f"  ✗ [{ticker_name}]  TIMED OUT after 3 min — skipping")
             except Exception as exc:
                 err_count += 1
-                logger.error(f"  ✗ [{futures[future]}]  EXCEPTION: {exc}", exc_info=True)
+                logger.error(f"  ✗ [{ticker_name}]  EXCEPTION: {exc}", exc_info=True)
 
     elapsed = time.time() - t0
     logger.info("═" * 70)
@@ -625,7 +632,7 @@ Examples:
     parser.add_argument("--no-download", action="store_true",
                         help="Skip downloads; reprocess CSVs already on disk")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                        help=f"Concurrent threads (default: {DEFAULT_WORKERS})")
+                        help=f"Concurrent threads (default: {DEFAULT_WORKERS}) — keep ≤ 5 for iShares")
     args = parser.parse_args()
 
     logger = setup_logging(args.date)

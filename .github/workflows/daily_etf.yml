@@ -39,7 +39,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       # ── 1. Checkout repo ──────────────────────────────────────────────────
@@ -81,7 +81,7 @@ jobs:
           fi
           python pipeline.py \
             --date ${{ steps.date.outputs.date }} \
-            --workers 15 \
+            --workers 3 \
             --update-meta \
             $TICKER_ARG
 
