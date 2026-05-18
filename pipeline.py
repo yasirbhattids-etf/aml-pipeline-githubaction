@@ -217,26 +217,40 @@ def download_holdings(
     download_url = build_download_url(product_url, date)
 
     try:
-        # Step 1: visit the product page to establish session cookies and
-        # set a realistic Referer — iShares 403s direct Ajax calls without this
+        # Step 1: visit the product page to set session cookies
+        # Use per-request headers (NOT session.headers.update) — session is
+        # shared across workers and concurrent updates cause a race condition
         logger.debug(f"[{ticker}] Warming session via product page...")
-        session.headers.update({"Referer": "https://www.ishares.com/"})
-        warm = session.get(product_url, timeout=REQUEST_TIMEOUT)
+        warm = session.get(
+            product_url,
+            timeout=REQUEST_TIMEOUT,
+            headers={"Referer": "https://www.ishares.com/"},
+        )
         if warm.status_code not in (200, 302):
-            logger.warning(f"[{ticker}] ✗ Product page returned HTTP {warm.status_code}")
+            logger.warning(f"[{ticker}] ✗ Product page HTTP {warm.status_code}")
             return None
-        time.sleep(1.0)   # brief pause after page visit, before CSV request
+        time.sleep(1.5)
 
-        # Step 2: download CSV with Referer set to the product page
-        session.headers.update({"Referer": product_url})
+        # Step 2: download CSV — Referer points to the product page
         logger.debug(f"[{ticker}] GET {download_url}")
-        resp = session.get(download_url, timeout=REQUEST_TIMEOUT)
+        resp = session.get(
+            download_url,
+            timeout=REQUEST_TIMEOUT,
+            headers={"Referer": product_url},
+        )
 
         if resp.status_code != 200:
             logger.warning(f"[{ticker}] ✗ HTTP {resp.status_code}")
             return None
         if len(resp.content) < 200:
             logger.warning(f"[{ticker}] ✗ Response too small ({len(resp.content)} bytes)")
+            return None
+
+        # Guard: iShares sometimes serves an HTML error page instead of CSV
+        # when bot detection triggers — detect and reject it
+        first_bytes = resp.content[:200].decode("ISO-8859-1", errors="ignore").strip()
+        if first_bytes.startswith("<") or "<!DOCTYPE" in first_bytes or "</div>" in first_bytes:
+            logger.warning(f"[{ticker}] ✗ Got HTML instead of CSV — bot detection triggered")
             return None
 
         dest.write_bytes(resp.content)
