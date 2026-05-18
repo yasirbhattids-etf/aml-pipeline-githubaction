@@ -246,11 +246,16 @@ def download_holdings(
             logger.warning(f"[{ticker}] ✗ Response too small ({len(resp.content)} bytes)")
             return None
 
-        # Guard: iShares sometimes serves an HTML error page instead of CSV
-        # when bot detection triggers — detect and reject it
-        first_bytes = resp.content[:200].decode("ISO-8859-1", errors="ignore").strip()
-        if first_bytes.startswith("<") or "<!DOCTYPE" in first_bytes or "</div>" in first_bytes:
-            logger.warning(f"[{ticker}] ✗ Got HTML instead of CSV — bot detection triggered")
+        # Guard: iShares serves a large HTML SPA page (~10MB) when bot detection
+        # triggers. It returns HTTP 200 with a large body so size checks don't
+        # help. Detect HTML by scanning the first 1000 bytes for markup.
+        sample = resp.content[:1000].decode("ISO-8859-1", errors="ignore")
+        sample_stripped = sample.strip().lstrip("\ufeff\xef\xbb\xbf")  # strip BOM
+        html_markers = ("<html", "<!doctype", "</div>", "<script", "<head>", "<body")
+        if (sample_stripped.startswith("<") or
+                any(m in sample.lower() for m in html_markers)):
+            logger.warning(f"[{ticker}] ✗ Got HTML instead of CSV — bot detection")
+            logger.debug(f"[{ticker}] First 200 chars: {sample[:200]!r}")
             return None
 
         dest.write_bytes(resp.content)
@@ -272,11 +277,18 @@ def download_holdings(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _find_header_line(lines: List[str]) -> int:
-    """Find the row index containing column headers (Ticker, Name, Sector)."""
+    """
+    Find the CSV header row (contains Ticker, Name, Sector).
+    Rejects lines that contain HTML tags — iShares sometimes returns an HTML
+    page that mentions these words inside markup like <td>Ticker</td>.
+    """
     for i, line in enumerate(lines):
         if "Ticker" in line and "Name" in line and "Sector" in line:
+            # Reject HTML lines — a real CSV header has no angle brackets
+            if "<" in line or ">" in line:
+                continue
             return i
-    raise ValueError("Cannot find header row — CSV structure may have changed")
+    raise ValueError("Cannot find CSV header row (no HTML-free line with Ticker/Name/Sector)")
 
 
 def _is_data_row(ticker_val: str) -> bool:
