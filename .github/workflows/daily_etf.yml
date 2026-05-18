@@ -40,6 +40,8 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: write   # needed to push db/meta.db back to repo
 
     steps:
       # ── 1. Checkout repo ──────────────────────────────────────────────────
