@@ -315,15 +315,31 @@ def parse_holdings_csv(
         lines = text.splitlines()
 
         header_idx = _find_header_line(lines)
-        data_text  = "\n".join(lines[header_idx:])
 
+        # Only pass real data lines to pd.read_csv — stop at first blank or
+        # footer prose line. Passing the entire file (with 10+ lines of legal
+        # boilerplate) causes pd.read_csv to hang on certain CSV patterns.
+        FOOTER_STARTS = ("This ", "The ", "©", "Â©", "Please",
+                         "CAREFULLY", "Holdings", "http", "Note")
+        data_lines = [lines[header_idx]]
+        for line in lines[header_idx + 1:]:
+            stripped = line.strip()
+            if not stripped:
+                break
+            if any(stripped.startswith(p) for p in FOOTER_STARTS):
+                break
+            data_lines.append(line)
+
+        # python engine is more forgiving than C engine on malformed rows
+        # (e.g. unclosed quotes in fund names) and never hangs on bad lines
         df = pd.read_csv(
-            io.StringIO(data_text),
+            io.StringIO("\n".join(data_lines)),
             dtype=str,
             on_bad_lines="skip",
+            engine="python",
         )
 
-        # ── Drop footer / blank / BOM rows ────────────────────────────────────
+        # ── Drop any stray footer / blank / BOM rows ──────────────────────────
         df = df[df["Ticker"].apply(_is_data_row)].copy()
 
         if df.empty:
