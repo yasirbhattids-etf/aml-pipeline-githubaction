@@ -97,7 +97,7 @@ MAX_RETRIES     = 3
 BACKOFF_FACTOR  = 1.5
 RATE_LIMIT_SLEEP = 2.0   # seconds between requests per worker — iShares rate limits aggressively
 
-DEFAULT_WORKERS = 3      # keep low — iShares throttles hard above ~5 concurrent
+DEFAULT_WORKERS = 1      # sequential — most reliable against rate limiting
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -157,10 +157,16 @@ def build_session() -> requests.Session:
     session.mount("https://", adapter)
     session.mount("http://",  adapter)
     session.headers.update({
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Encoding": "identity",
-        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest":  "document",
+        "Sec-Fetch-Mode":  "navigate",
+        "Sec-Fetch-Site":  "none",
+        "Sec-Fetch-User":  "?1",
     })
     return session
 
@@ -208,36 +214,37 @@ def download_holdings(
         logger.debug(f"[{ticker}] Already on disk — skipping download")
         return dest
 
-    url = build_download_url(product_url, date)
-    logger.debug(f"[{ticker}] GET {url}")
+    download_url = build_download_url(product_url, date)
 
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT, stream=True)
+        # Step 1: visit the product page to establish session cookies and
+        # set a realistic Referer — iShares 403s direct Ajax calls without this
+        logger.debug(f"[{ticker}] Warming session via product page...")
+        session.headers.update({"Referer": "https://www.ishares.com/"})
+        warm = session.get(product_url, timeout=REQUEST_TIMEOUT)
+        if warm.status_code not in (200, 302):
+            logger.warning(f"[{ticker}] ✗ Product page returned HTTP {warm.status_code}")
+            return None
+        time.sleep(1.0)   # brief pause after page visit, before CSV request
+
+        # Step 2: download CSV with Referer set to the product page
+        session.headers.update({"Referer": product_url})
+        logger.debug(f"[{ticker}] GET {download_url}")
+        resp = session.get(download_url, timeout=REQUEST_TIMEOUT)
+
         if resp.status_code != 200:
             logger.warning(f"[{ticker}] ✗ HTTP {resp.status_code}")
             return None
-
-        # Stream in chunks — if server stalls between packets for > read_timeout
-        # seconds, requests raises ReadTimeout instead of hanging forever
-        chunks, total = [], 0
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                chunks.append(chunk)
-                total += len(chunk)
-                if total > MAX_FILE_SIZE:
-                    logger.warning(f"[{ticker}] ✗ File > 50 MB — skipping")
-                    return None
-
-        if total < 200:
-            logger.warning(f"[{ticker}] ✗ Response too small ({total} bytes)")
+        if len(resp.content) < 200:
+            logger.warning(f"[{ticker}] ✗ Response too small ({len(resp.content)} bytes)")
             return None
 
-        dest.write_bytes(b"".join(chunks))
-        logger.info(f"[{ticker}] ✓ Downloaded {total:,} bytes → {filename}")
+        dest.write_bytes(resp.content)
+        logger.info(f"[{ticker}] ✓ Downloaded {len(resp.content):,} bytes → {filename}")
         return dest
 
     except requests.exceptions.Timeout:
-        logger.error(f"[{ticker}] ✗ Timed out (server stalled)")
+        logger.error(f"[{ticker}] ✗ Timed out after {REQUEST_TIMEOUT}s")
         return None
     except requests.RequestException as exc:
         logger.error(f"[{ticker}] ✗ Request error: {exc}")
@@ -534,6 +541,15 @@ def run(
         sys.exit(1)
 
     master = master.dropna(subset=["Product_URL"])
+
+    # Only US-hosted product URLs support the Ajax download endpoint.
+    # UK/UCITS (ie), DE, CH funds use a different endpoint — skip for now.
+    # This matches the original etf.py behaviour (Domicile == United States).
+    if "us_only" not in str(ticker_list):   # don't double-filter on explicit list
+        us_mask = master["Product_URL"].str.contains("/us/products/", na=False)
+        non_us  = (~us_mask).sum()
+        master  = master[us_mask]
+        logger.info(f"Filtered to US-hosted funds: {len(master)} (skipped {non_us} UK/DE/CH)")
 
     if ticker_list:
         master = master[master["Ticker"].isin(ticker_list)]
